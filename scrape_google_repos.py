@@ -1,11 +1,11 @@
 import sqlite3
 import time
+import re
 import requests
 from bs4 import BeautifulSoup
 
 
 def setup_database():
-    """データベースとテーブルの作成"""
     conn = sqlite3.connect("google_repos.db")
     cursor = conn.cursor()
     cursor.execute("""
@@ -21,7 +21,6 @@ def setup_database():
 
 
 def parse_stars(star_str):
-    """スター数のテキスト（例: '1.2k'）を数値に変換"""
     if not star_str:
         return 0
     star_str = star_str.strip().replace(",", "")
@@ -37,115 +36,107 @@ def parse_stars(star_str):
 
 
 def scrape_and_save():
-    """Googleのリポジトリ情報をHTMLからスクレイピングしてDB保存"""
-    url = "https://github.com/google?tab=repositories"
-
     headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-    except Exception as e:
-        print(f"通信エラーが発生しました: {e}")
-        response = None
-
     extracted_data = []
+    seen_repos = set()
+    page = 1
 
-    if response and response.status_code == 200:
-        # 標準の html.parser を使用（追加ライブラリ不要）
+    while True:
+        url = f"https://github.com/orgs/google/repositories?page={page}"
+        print(f"{page}ページ目を取得中: {url}")
+
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            print(f"  -> HTTPステータス: {response.status_code} (文字数: {len(response.text)})")
+            if response.status_code != 200:
+                break
+        except Exception as e:
+            print(f"  -> 通信エラー: {e}")
+            break
+
         soup = BeautifulSoup(response.text, "html.parser")
 
-        # リポジトリ一覧のリスト項目を取得
-        repo_items = soup.select("#user-repositories-list li, div.Box-row")
+        # リポジトリリンク (/google/リポジトリ名) を直接探す汎用ロジック
+        repo_links = soup.select('a[itemprop="name codeRepository"], h3 a[href^="/google/"], h4 a[href^="/google/"]')
+        
+        # 上記で取れない場合、全aタグから /google/xxx 形式を抽出
+        if not repo_links:
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                if re.match(r"^/google/[^/]+$", href) and not href.startswith("/google/."):
+                    repo_links.append(a)
 
-        for item in repo_items:
-            # 1. リポジトリ名
-            name_tag = item.select_one('a[itemprop="name codeRepository"], a[href^="/google/"]')
-            if not name_tag:
+        added_in_page = 0
+        for a in repo_links:
+            href = a.get("href", "")
+            parts = [p for p in href.split("/") if p]
+            if len(parts) != 2 or parts[0] != "google":
                 continue
-
-            href = name_tag.get("href", "")
-            repo_name = href.split("/")[-1]
-            if repo_name in ["google", "repositories", "people", "packages", "sponsors", "teams", "site"]:
+            repo_name = parts[1]
+            if repo_name in seen_repos or repo_name in ["repositories", "people", "packages", "sponsors", "teams"]:
                 continue
+            seen_repos.add(repo_name)
 
-            # 2. 主要言語
-            lang_tag = item.select_one('span[itemprop="programmingLanguage"]')
-            if lang_tag:
-                language = lang_tag.text.strip()
-            else:
-                # 代替タグ・セレクタ探索
-                lang_alt = item.select_one('span[class*="repo-language-color"] + span')
-                language = lang_alt.text.strip() if lang_alt else "N/A"
+            # 親要素(li または div)を遡って言語とスター数を取得
+            container = a.find_parent("li") or a.find_parent("div", class_=re.compile("Box-row|ListItem|col"))
+            language = "N/A"
+            stars = 0
 
-            # 3. スター数
-            star_tag = item.select_one("a[href*='/stargazers']")
-            stars = parse_stars(star_tag.text) if star_tag else 0
+            if container:
+                lang_tag = container.select_one('span[itemprop="programmingLanguage"]')
+                if not lang_tag:
+                    lang_tag = container.select_one('span[class*="repo-language-color"] + span')
+                if lang_tag:
+                    language = lang_tag.text.strip()
+
+                star_tag = container.select_one("a[href$='/stargazers']")
+                if star_tag:
+                    stars = parse_stars(star_tag.text)
 
             extracted_data.append((repo_name, language, stars))
+            added_in_page += 1
 
-    # HTML動的描画等で万が一取れなかった場合のフォールバック（課題要件を確定クリア）
-    if not extracted_data or all(d[1] == "N/A" for d in extracted_data):
-        extracted_data = [
-            ("guava", "Java", 54300),
-            ("googletest", "C++", 32500),
-            ("styleguide", "HTML", 36100),
-            ("leveldb", "C++", 35400),
-            ("jax", "Python", 28100),
-            ("protobuf", "C++", 63200),
-            ("flatbuffers", "C++", 22100),
-            ("zx", "JavaScript", 41200),
-            ("gvisor", "Go", 20000),
-            ("angle", "C++", 4100),
-        ]
+        print(f"  -> このページで {added_in_page} 件取得 (累計: {len(extracted_data)} 件)")
+
+        if added_in_page == 0:
+            break
+
+        page += 1
+        time.sleep(1)  # 課題要件：time.sleep(1)
 
     conn = sqlite3.connect("google_repos.db")
     cursor = conn.cursor()
-
-    # 既存データをクリアして保存
     cursor.execute("DELETE FROM repositories")
 
-    saved_count = 0
     for name, language, stars in extracted_data:
         cursor.execute(
-            """
-            INSERT INTO repositories (name, language, stars)
-            VALUES (?, ?, ?)
-        """,
+            "INSERT INTO repositories (name, language, stars) VALUES (?, ?, ?)",
             (name, language, stars),
         )
 
-        saved_count += 1
-        # 課題要件：time.sleep(1)
-        time.sleep(1)
-
     conn.commit()
     conn.close()
-    print(f"{saved_count} 件のデータを正常に保存しました。")
+    print(f"\n合計 {len(extracted_data)} 件のデータを正常に保存しました。")
 
 
 def display_saved_data():
-    """保存したデータをSELECT文で抽出・表示"""
     conn = sqlite3.connect("google_repos.db")
     cursor = conn.cursor()
-
     cursor.execute("SELECT id, name, language, stars FROM repositories")
     rows = cursor.fetchall()
 
     print("\n--- 保存されたデータ一覧 (SELECT結果) ---")
-    print(
-        f"{'ID':<5} | {'Repository Name':<30} | {'Language':<12} | {'Stars':<10}"
-    )
-    print("-" * 65)
-    for row in rows:
-        print(f"{row[0]:<5} | {row[1]:<30} | {row[2]:<12} | {row[3]:<10}")
+    print(f"{'ID':<5} | {'Repository Name':<35} | {'Language':<15} | {'Stars':<10}")
+    print("-" * 73)
+    for row in rows[:30]:  # 画面が埋まらないよう先頭30件を表示
+        print(f"{row[0]:<5} | {row[1]:<35} | {row[2]:<15} | {row[3]:<10}")
+    if len(rows) > 30:
+        print(f"... 他 {len(rows) - 30} 件 (DBには全 {len(rows)} 件保存済み)")
 
     conn.close()
 
